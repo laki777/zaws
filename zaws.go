@@ -4,6 +4,12 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
 	"github.com/AlekSi/zabbix-sender"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
@@ -11,10 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/cloudwatch"
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/aws/aws-sdk-go/service/elb"
-	"net"
-	"os"
-	"strconv"
-	"time"
+	"github.com/aws/aws-sdk-go/service/rds"
 )
 
 type Zaws struct {
@@ -75,10 +78,11 @@ type Data struct {
 	InstancePrivateAddr string `json:"{#INSTANCE.PRIVATE.ADDR},omitempty"`
 	ElbName             string `json:"{#ELB.NAME},omitempty"`
 	ElbDnsName          string `json:"{#ELB.DNS.NAME},omitempty"`
+	RdsName             string `json:"{#RDS.NAME},omitempty"`
+	RdsDnsName          string `json:"{#RDS.DNS.NAME},omitempty"`
 }
 
 // Common util
-
 func usage() {
 	fmt.Println("Usage: zaws service method [target] [-region|-r] [-key|-k] [-secret|-s] [-id|-i] [-metric|-m] [-host|h] [-port|p]")
 	os.Exit(1)
@@ -110,14 +114,19 @@ func get_metric_list(sess *session.Session, identity_name, target_id string) []*
 }
 
 func get_metric_stats(sess *session.Session, identity_name, target_id, metric_name, metric_namespace string) []*cloudwatch.Datapoint {
-
+	var output string
+	if strings.Contains(metric_name, "HTTPCode") {
+		output = "Sum"
+	} else {
+		output = "Average"
+	}
 	svc := cloudwatch.New(sess)
 	t := time.Now()
 	input := &cloudwatch.GetMetricStatisticsInput{
 		Namespace:  aws.String(metric_namespace),
-		Statistics: []*string{aws.String("Average")},
+		Statistics: []*string{aws.String(output)},
 		EndTime:    aws.Time(t),
-		Period:     aws.Int64(300),
+		Period:     aws.Int64(60),
 		StartTime:  aws.Time(t.Add(time.Duration(-10) * time.Minute)),
 		MetricName: aws.String(metric_name),
 		Dimensions: []*cloudwatch.Dimension{
@@ -148,6 +157,20 @@ func get_ec2_list(sess *session.Session) []*ec2.Instance {
 		instances = append(instances, reservation.Instances...)
 	}
 	return instances
+}
+
+func get_rds_list(sess *session.Session) []*rds.DBInstance {
+
+	svc := rds.New(sess)
+
+	resp, err := svc.DescribeDBInstances(nil)
+
+	if err != nil {
+		fmt.Printf("[ERROR] Fail DescribeDBInstances API call: %s \n", err.Error())
+		os.Exit(1)
+	}
+
+	return resp.DBInstances
 }
 
 func get_elb_list(sess *session.Session) []*elb.LoadBalancerDescription {
@@ -196,11 +219,36 @@ func (z *Zaws) ShowElbList() {
 	fmt.Printf(convert_to_lldjson_string(list))
 }
 
+func (z *Zaws) ShowRdsList() {
+	list := make([]Data, 0)
+	rds_s := get_rds_list(z.AwsSession)
+	for _, rds_v := range rds_s {
+		data := Data{RdsName: *rds_v.DBInstanceIdentifier, RdsDnsName: *rds_v.Endpoint.Address}
+		list = append(list, data)
+	}
+	fmt.Printf(convert_to_lldjson_string(list))
+}
+
 func (z *Zaws) ShowEC2CloudwatchMetricsList() {
 	list := make([]Data, 0)
 	metrics := get_metric_list(z.AwsSession, "InstanceId", z.TargetId)
 	for _, metric := range metrics {
 		datapoints := get_metric_stats(z.AwsSession, "InstanceId", z.TargetId, *metric.MetricName, *metric.Namespace)
+		data := Data{MetricName: *metric.MetricName, MetricNamespace: *metric.Namespace}
+		if len(datapoints) > 0 {
+			data.MetricUnit = *datapoints[0].Unit
+		}
+		list = append(list, data)
+	}
+
+	fmt.Printf(convert_to_lldjson_string(list))
+}
+
+func (z *Zaws) ShowRDSCloudwatchMetricsList() {
+	list := make([]Data, 0)
+	metrics := get_metric_list(z.AwsSession, "DBInstanceIdentifier", z.TargetId)
+	for _, metric := range metrics {
+		datapoints := get_metric_stats(z.AwsSession, "DBInstanceIdentifier", z.TargetId, *metric.MetricName, *metric.Namespace)
 		data := Data{MetricName: *metric.MetricName, MetricNamespace: *metric.Namespace}
 		if len(datapoints) > 0 {
 			data.MetricUnit = *datapoints[0].Unit
@@ -236,6 +284,9 @@ func (z *Zaws) ShowELBCloudwatchMetricsList() {
 func (z *Zaws) SendEc2MetricStats() {
 	z.SendMetricStats("InstanceId")
 }
+func (z *Zaws) SendRdsMetricStats() {
+	z.SendMetricStats("DBInstanceIdentifier")
+}
 func (z *Zaws) SendElbMetricStats() {
 	z.SendMetricStats("LoadBalancerName")
 }
@@ -256,7 +307,13 @@ func (z *Zaws) SendMetricStats(identity_name string) {
 
 		if len(datapoints) > 0 {
 			data_time := *datapoints[0].Timestamp
-			send_data = append(send_data, zabbix_sender.DataItem{Hostname: z.TargetId, Key: "cloudwatch.metric[" + metric_name + "]", Value: strconv.FormatFloat(*datapoints[0].Average, 'f', 4, 64), Timestamp: data_time.Unix()})
+			if strings.Contains(metric_name, "HTTPCode") {
+				send_data = append(send_data, zabbix_sender.DataItem{Hostname: z.TargetId, Key: "cloudwatch.metric[" + metric_name + "]", Value: strconv.FormatFloat(*datapoints[0].Sum, 'f', 4, 64), Timestamp: data_time.Unix()})
+				fmt.Println(send_data)
+
+			} else {
+				send_data = append(send_data, zabbix_sender.DataItem{Hostname: z.TargetId, Key: "cloudwatch.metric[" + metric_name + "]", Value: strconv.FormatFloat(*datapoints[0].Average, 'f', 4, 64), Timestamp: data_time.Unix()})
+			}
 		}
 	}
 	addr, _ := net.ResolveTCPAddr("tcp", z.ZabbixHost+":"+z.ZabbixPort)
@@ -291,6 +348,15 @@ func main() {
 		default:
 			usage()
 		}
+	case "rds":
+		switch os.Args[2] {
+		case "list":
+			os.Args = os.Args[2:]
+			zaws := NewZaws()
+			zaws.ShowRdsList()
+		default:
+			usage()
+		}
 	case "cloudwatch":
 		switch os.Args[2] {
 		case "list":
@@ -303,6 +369,9 @@ func main() {
 				zaws := NewZaws()
 				zaws.ShowEC2CloudwatchMetricsList()
 			case "rds":
+				os.Args = os.Args[3:]
+				zaws := NewZaws()
+				zaws.ShowRDSCloudwatchMetricsList()
 			case "elb":
 				os.Args = os.Args[3:]
 				zaws := NewZaws()
@@ -319,6 +388,10 @@ func main() {
 				os.Args = os.Args[3:]
 				zaws := NewZaws()
 				zaws.SendEc2MetricStats()
+			case "rds":
+				os.Args = os.Args[3:]
+				zaws := NewZaws()
+				zaws.SendRdsMetricStats()
 			case "elb":
 				os.Args = os.Args[3:]
 				zaws := NewZaws()
